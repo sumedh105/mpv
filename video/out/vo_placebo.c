@@ -95,6 +95,82 @@ static void reset_queue(struct priv *p)
     p->last_dst_pts = 0.0;
 }
 
+// This struct is stored at the end of DR-allocated buffers, and serves to both
+// detect such buffers and hold the reference to the actual GPU buffer.
+struct dr_buf {
+    uint64_t sentinel[2];
+    pl_gpu gpu;
+    pl_buf buf;
+};
+
+static const uint64_t dr_magic[2] = { 0xc6e9222474db53ae, 0x9d49b2de6c3b563e };
+static const size_t dr_align = offsetof(struct { char c; struct dr_buf dr; }, dr);
+static inline struct dr_buf *dr_header(void *ptr, size_t size)
+{
+    uintptr_t start = (uintptr_t) ptr + size - sizeof(struct dr_buf);
+    uintptr_t aligned = MP_ALIGN_DOWN(start, dr_align);
+    assert(aligned >= start);
+    return (struct dr_buf *) aligned;
+}
+
+static pl_buf get_dr_buf(struct mp_image *mpi)
+{
+    if (!mpi->bufs[0] || mpi->bufs[0]->size < sizeof(struct dr_buf))
+        return NULL;
+
+    struct dr_buf *dr = dr_header(mpi->bufs[0]->data, mpi->bufs[0]->size);
+    if (memcmp(dr->sentinel, dr_magic, sizeof(dr_magic)) == 0)
+        return dr->buf;
+
+    return NULL;
+}
+
+static void free_dr_buf(void *opaque, uint8_t *data)
+{
+    struct dr_buf *dr = opaque;
+    // Can't use `&dr->buf` because it gets freed during `pl_buf_destroy`
+    pl_buf_destroy(dr->gpu, &(pl_buf) { dr->buf });
+}
+
+static struct mp_image *get_image(struct vo *vo, int imgfmt, int w, int h,
+                                  int stride_align)
+{
+    struct priv *p = vo->priv;
+    pl_gpu gpu = p->gpu;
+    pl_gpu_caps req = PL_GPU_CAP_THREAD_SAFE | PL_GPU_CAP_MAPPED_BUFFERS;
+    if ((gpu->caps & req) != req)
+        return NULL;
+
+    int size = mp_image_get_alloc_size(imgfmt, w, h, stride_align);
+    if (size < 0)
+        return NULL;
+
+    pl_buf buf = pl_buf_create(gpu, &(struct pl_buf_params) {
+        .size = size + stride_align + sizeof(struct dr_buf) + dr_align,
+        .memory_type = PL_BUF_MEM_HOST,
+        .host_mapped = true,
+    });
+
+    if (!buf)
+        return NULL;
+
+    // Store the DR header at the end of the allocation
+    struct dr_buf *dr = dr_header(buf->data, buf->params.size);
+    memcpy(dr->sentinel, dr_magic, sizeof(dr_magic));
+    dr->gpu = gpu;
+    dr->buf = buf;
+
+    struct mp_image *mpi = mp_image_from_buffer(imgfmt, w, h, stride_align,
+                                                buf->data, buf->params.size,
+                                                dr, free_dr_buf);
+    if (!mpi) {
+        pl_buf_destroy(gpu, &buf);
+        return NULL;
+    }
+
+    return mpi;
+}
+
 static void write_overlays(struct vo *vo, struct mp_osd_res res, double pts,
                            int flags, struct osd_state *state,
                            struct pl_frame *frame)
@@ -187,14 +263,36 @@ static bool map_frame(const struct pl_gpu *gpu, const struct pl_tex **tex,
 {
     struct mp_image *mpi = src->frame_data;
     struct frame_priv *fp = mpi->priv;
+    struct pl_plane_data data[4] = {0};
     struct vo *vo = fp->vo;
 
+    // Re-use the AVFrame helpers to make this infinitely easier
     struct AVFrame *avframe = mp_image_to_av_frame(mpi);
-    bool ok = pl_upload_avframe(gpu, out_frame, tex, avframe);
+    pl_frame_from_avframe(out_frame, avframe);
+    pl_plane_data_from_pixfmt(data, &out_frame->repr.bits, avframe->format);
     av_frame_free(&avframe);
-    if (!ok) {
-        MP_ERR(vo, "Failed uploading frame!\n");
-        return false;
+
+    for (int p = 0; p < mpi->num_planes; p++) {
+        data[p].width = mp_image_plane_w(mpi, p);
+        data[p].height = mp_image_plane_h(mpi, p);
+        data[p].row_stride = mpi->stride[p];
+        data[p].pixels = mpi->planes[p];
+
+        pl_buf buf = get_dr_buf(mpi);
+        if (buf) {
+            data[p].pixels = NULL;
+            data[p].buf = buf;
+            data[p].buf_offset = mpi->planes[p] - buf->data;
+        } else if (gpu->caps & PL_GPU_CAP_CALLBACKS) {
+            data[p].callback = talloc_free;
+            data[p].priv = mp_image_new_ref(mpi);
+        }
+
+        if (!pl_upload_plane(gpu, &out_frame->planes[p], &tex[p], &data[p])) {
+            MP_ERR(vo, "Failed uploading frame!\n");
+            talloc_free(data[p].priv);
+            return false;
+        }
     }
 
     // Generate subtitles for this frame
@@ -543,7 +641,7 @@ const struct vo_driver video_out_placebo = {
     .query_format = query_format,
     .reconfig = reconfig,
     .control = control,
-    //.get_image = get_image,
+    .get_image_ts = get_image,
     .draw_frame = draw_frame,
     .flip_page = flip_page,
     .get_vsync = get_vsync,

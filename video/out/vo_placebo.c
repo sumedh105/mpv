@@ -17,8 +17,8 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <libplacebo/gpu.h>
-#include <libplacebo/swapchain.h>
+#include <libplacebo/renderer.h>
+#include <libplacebo/shaders/lut.h>
 #include <libplacebo/utils/libav.h>
 #include <libplacebo/utils/frame_queue.h>
 
@@ -66,6 +66,13 @@ struct user_hook {
     const struct pl_hook *hook;
 };
 
+struct user_lut {
+    char *opt;
+    char *path;
+    int type;
+    struct pl_custom_lut *lut;
+};
+
 struct priv {
     struct mp_log *log;
     struct mpv_global *global;
@@ -108,6 +115,10 @@ struct priv {
     char *icc_path;
 #endif
 
+    struct user_lut image_lut;
+    struct user_lut target_lut;
+    struct user_lut lut;
+
     // Cached shaders, preserved across options updates
     struct user_hook *user_hooks;
     int num_user_hooks;
@@ -116,6 +127,9 @@ struct priv {
     int builtin_scalers;
     int inter_preserve;
 };
+
+static void update_render_options(struct priv *p);
+static void update_lut(struct priv *p, struct user_lut *lut);
 
 static void reset_queue(struct priv *p)
 {
@@ -295,6 +309,7 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
     struct frame_priv *fp = mpi->priv;
     struct pl_plane_data data[4] = {0};
     struct vo *vo = fp->vo;
+    struct priv *p = vo->priv;
 
     // TODO: implement support for hwdec wrappers
 
@@ -304,25 +319,25 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
     pl_plane_data_from_pixfmt(data, &out_frame->repr.bits, avframe->format);
     av_frame_free(&avframe);
 
-    for (int p = 0; p < mpi->num_planes; p++) {
-        data[p].width = mp_image_plane_w(mpi, p);
-        data[p].height = mp_image_plane_h(mpi, p);
-        data[p].row_stride = mpi->stride[p];
-        data[p].pixels = mpi->planes[p];
+    for (int n = 0; n < mpi->num_planes; n++) {
+        data[n].width = mp_image_plane_w(mpi, n);
+        data[n].height = mp_image_plane_h(mpi, n);
+        data[n].row_stride = mpi->stride[n];
+        data[n].pixels = mpi->planes[n];
 
         pl_buf buf = get_dr_buf(mpi);
         if (buf) {
-            data[p].pixels = NULL;
-            data[p].buf = buf;
-            data[p].buf_offset = mpi->planes[p] - buf->data;
+            data[n].pixels = NULL;
+            data[n].buf = buf;
+            data[n].buf_offset = mpi->planes[n] - buf->data;
         } else if (gpu->caps & PL_GPU_CAP_CALLBACKS) {
-            data[p].callback = talloc_free;
-            data[p].priv = mp_image_new_ref(mpi);
+            data[n].callback = talloc_free;
+            data[n].priv = mp_image_new_ref(mpi);
         }
 
-        if (!pl_upload_plane(gpu, &out_frame->planes[p], &tex[p], &data[p])) {
+        if (!pl_upload_plane(gpu, &out_frame->planes[n], &tex[n], &data[n])) {
             MP_ERR(vo, "Failed uploading frame!\n");
-            talloc_free(data[p].priv);
+            talloc_free(data[n].priv);
             return false;
         }
     }
@@ -330,6 +345,11 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
     // Generate subtitles for this frame
     struct mp_osd_res vidres = { mpi->w, mpi->h };
     write_overlays(vo, vidres, mpi->pts, OSD_DRAW_SUB_ONLY, &fp->subs, out_frame);
+
+    // Update LUT attached to this frame
+    update_lut(p, &p->image_lut);
+    out_frame->lut = p->image_lut.lut;
+    out_frame->lut_type = p->image_lut.type;
     return true;
 }
 
@@ -353,14 +373,16 @@ static void discard_frame(const struct pl_source_frame *src)
     talloc_free(mpi);
 }
 
-static void update_options(struct priv *p);
-
 static void draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct priv *p = vo->priv;
     pl_gpu gpu = p->gpu;
     if (m_config_cache_update(p->opts_cache))
-        update_options(p);
+        update_render_options(p);
+
+    update_lut(p, &p->lut);
+    p->params.lut = p->lut.lut;
+    p->params.lut_type = p->lut.type;
 
     // Update equalizer state
     struct mp_csp_params cparams = MP_CSP_PARAMS_DEFAULTS;
@@ -412,6 +434,10 @@ static void draw_frame(struct vo *vo, struct vo_frame *frame)
     pl_frame_from_swapchain(&target, &swframe);
     write_overlays(vo, p->osd_res, 0, OSD_DRAW_OSD_ONLY, &p->osd_state, &target);
     target.crop = (struct pl_rect2df) { p->dst.x0, p->dst.y0, p->dst.x1, p->dst.y1 };
+
+    update_lut(p, &p->target_lut);
+    target.lut = p->target_lut.lut;
+    target.lut_type = p->target_lut.type;
 
 #ifdef PL_HAVE_LCMS
     target.profile = (struct pl_icc_profile) {
@@ -594,11 +620,12 @@ static int control(struct vo *vo, uint32_t request, void *data)
         p->ra_ctx->opts.want_alpha = opts->alpha_mode == 1;
         if (p->ra_ctx->fns->update_render_opts)
             p->ra_ctx->fns->update_render_opts(p->ra_ctx);
-        update_options(p);
+        update_render_options(p);
         vo->want_redraw = true;
 
-        // Also re-query the auto profile, in case `update_options` unloaded a
-        // manually specified icc profile in favor of icc-profile-auto
+        // Also re-query the auto profile, in case `update_render_options`
+        // unloaded a manually specified icc profile in favor of
+        // icc-profile-auto
         int events = 0;
         update_auto_profile(p, &events);
         vo_event(vo, events);
@@ -732,7 +759,7 @@ done:
     // wasteful since we pass these through libplacebo's frame queueing
     // mechanism, which only uploads frames on an as-needed basis.
     vo_set_queue_params(vo, 0, VO_MAX_REQ_FRAMES);
-    update_options(p);
+    update_render_options(p);
     return 0;
 
 err_out:
@@ -881,7 +908,31 @@ static void update_icc_opts(struct priv *p, const struct mp_icc_opts *opts)
 #endif // PL_HAVE_LCMS
 }
 
-static void update_options(struct priv *p)
+static void update_lut(struct priv *p, struct user_lut *lut)
+{
+    if (!lut->opt) {
+        pl_lut_free(&lut->lut);
+        TA_FREEP(&lut->path);
+        return;
+    }
+
+    if (lut->path && strcmp(lut->path, lut->opt) == 0)
+        return; // no change
+
+    // Update cached path
+    pl_lut_free(&lut->lut);
+    talloc_free(lut->path);
+    lut->path = talloc_strdup(p, lut->opt);
+
+    // Load LUT file
+    char *fname = mp_get_user_path(NULL, p->global, lut->path);
+    MP_VERBOSE(p, "Loading custom LUT '%s'\n", fname);
+    struct bstr lutdata = stream_read_file(fname, p, p->global, 100000000); // 100 MB
+    lut->lut = pl_lut_parse_cube(p->pllog, lutdata.start, lutdata.len);
+    talloc_free(lutdata.start);
+}
+
+static void update_render_options(struct priv *p)
 {
     const struct gl_video_opts *opts = p->opts_cache->opts;
     p->params = pl_render_default_params;
@@ -972,6 +1023,14 @@ static void update_options(struct priv *p)
 
 #define OPT_BASE_STRUCT struct priv
 
+const struct m_opt_choice_alternatives lut_types[] = {
+    {"auto",        PL_LUT_UNKNOWN},
+    {"native",      PL_LUT_NATIVE},
+    {"normalized",  PL_LUT_NORMALIZED},
+    {"conversion",  PL_LUT_CONVERSION},
+    {0}
+};
+
 const struct vo_driver video_out_placebo = {
     .description = "Video output based on libplacebo",
     .name = "placebo",
@@ -992,10 +1051,17 @@ const struct vo_driver video_out_placebo = {
         .builtin_scalers = true,
         .inter_preserve = true,
     },
+
     .options = (const struct m_option[]) {
         {"allow-delayed-peak-detect", OPT_FLAG(delayed_peak)},
         {"builtin-scalers", OPT_FLAG(builtin_scalers)},
         {"interpolation-preserve", OPT_FLAG(inter_preserve)},
+        {"lut", OPT_STRING(lut.opt), .flags = M_OPT_FILE},
+        {"lut-type", OPT_CHOICE_C(lut.type, lut_types)},
+        {"image-lut", OPT_STRING(image_lut.opt), .flags = M_OPT_FILE},
+        {"image-lut-type", OPT_CHOICE_C(image_lut.type, lut_types)},
+        {"target-lut", OPT_STRING(target_lut.opt), .flags = M_OPT_FILE},
+        // No `target-lut-type` because we don't support non-RGB targets
         {0}
     },
 };

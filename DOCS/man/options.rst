@@ -6067,6 +6067,29 @@ them.
 
     NOTE: Only implemented on macOS.
 
+``--image-lut=<file>``
+    Specifies a custom LUT file (in Adobe .cube format) to apply to the colors
+    during image decoding. The exact interpretation of the LUT depends on
+    the value of ``--image-lut-type``. (Only for ``--vo=placebo``)
+
+``--image-lut-type=<value>``
+    Controls the interpretation of color values fed to and from the LUT
+    specified as ``--image-lut``. Valid values are:
+
+    auto
+        Chooses the interpretation of the LUT automatically from tagged
+        metadata, and otherwise falls back to ``native``. (Default)
+    native
+        Applied to the raw image contents in its native colorspace, before
+        decoding to RGB. For example, for a HDR10 image, this would be fed
+        PQ-encoded YCbCr values in the range 0.0 - 1.0.
+    normalized
+        Applied to the normalized RGB image contents, after decoding from
+        its native color encoding, but before linearization.
+    conversion
+        Fully replaces the color decoding. A LUT of this type should ingest the
+        image's native colorspace and output normalized non-linear RGB.
+
 ``--target-prim=<value>``
     Specifies the primaries of the display. Video colors will be adapted to
     this colorspace when ICC color management is not being used. Valid values
@@ -6181,6 +6204,12 @@ them.
 
         In such a configuration, we highly recommend setting ``--tone-mapping``
         to ``mobius`` or even ``clip``.
+
+``--target-lut=<file>``
+    Specifies a custom LUT file (in Adobe .cube format) to apply to the colors
+    before display on-screen. This LUT is fed values in normalized RGB, after
+    encoding into the target colorspace, so after the application of
+    ``--target-trc``. (Only for ``--vo=placebo``)
 
 ``--tone-mapping=<value>``
     Specifies the algorithm used for tone-mapping images onto the target
@@ -6390,6 +6419,30 @@ them.
     content. The default of 0 means no limit if the detected contrast is less
     than 100000, and limits to 1000 otherwise. Use ``--icc-contrast=inf`` to
     preserve the infinite contrast (most likely when using OLED displays).
+
+``--lut=<file>``
+    Specifies a custom LUT (in Adobe .cube format) to apply to the colors
+    as part of color conversion. The exact interpretation depends on the value
+    of ``--lut-type``. (Only for ``--vo=placebo``)
+
+``--lut-type=<value>``
+    Controls the interpretation of color values fed to and from the LUT
+    specified as ``--lut``. Valid values are:
+
+    auto
+        Chooses the interpretation of the LUT automatically from tagged
+        metadata, and otherwise falls back to ``native``. (Default)
+    native
+        Applied to raw image contents in its native RGB colorspace (non-linear
+        light), before conversion to the output color space.
+    normalized
+        Applied to the normalized RGB image contents, in linear light, before
+        conversion to the output color space.
+    conversion
+        Fully replaces the conversion from the image color space to the output
+        color space. If such a LUT is present, it has the highest priority, and
+        overrides any ICC profiles, as well as options related to tone mapping
+        and output colorimetry (``--target-prim``, ``--target-trc`` etc.).
 
 ``--blend-subtitles=<yes|video|no>``
     Blend subtitles directly onto upscaled video frames, before interpolation

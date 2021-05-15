@@ -106,3 +106,71 @@ enum pl_color_transfer mp_trc_to_pl(enum mp_csp_trc trc)
 
     assert(!"unreachable");
 }
+
+enum pl_color_light mp_light_to_pl(enum mp_csp_light light)
+{
+    switch (light) {
+    case MP_CSP_LIGHT_AUTO:         return PL_COLOR_LIGHT_UNKNOWN;
+    case MP_CSP_LIGHT_DISPLAY:      return PL_COLOR_LIGHT_DISPLAY;
+    case MP_CSP_LIGHT_SCENE_HLG:    return PL_COLOR_LIGHT_SCENE_HLG;
+    case MP_CSP_LIGHT_SCENE_709_1886: return PL_COLOR_LIGHT_SCENE_709_1886;
+    case MP_CSP_LIGHT_SCENE_1_2:    return PL_COLOR_LIGHT_SCENE_1_2;
+    case MP_CSP_LIGHT_COUNT:        return PL_COLOR_LIGHT_COUNT;
+    }
+
+    assert(!"unreachable");
+}
+
+enum pl_color_system mp_csp_to_pl(enum mp_csp csp)
+{
+    switch (csp) {
+    case MP_CSP_AUTO:               return PL_COLOR_SYSTEM_UNKNOWN;
+    case MP_CSP_BT_601:             return PL_COLOR_SYSTEM_BT_601;
+    case MP_CSP_BT_709:             return PL_COLOR_SYSTEM_BT_709;
+    case MP_CSP_SMPTE_240M:         return PL_COLOR_SYSTEM_SMPTE_240M;
+    case MP_CSP_BT_2020_NC:         return PL_COLOR_SYSTEM_BT_2020_NC;
+    case MP_CSP_BT_2020_C:          return PL_COLOR_SYSTEM_BT_2020_C;
+    case MP_CSP_RGB:                return PL_COLOR_SYSTEM_RGB;
+    case MP_CSP_XYZ:                return PL_COLOR_SYSTEM_XYZ;
+    case MP_CSP_YCGCO:              return PL_COLOR_SYSTEM_YCGCO;
+    case MP_CSP_COUNT:              return PL_COLOR_SYSTEM_COUNT;
+    }
+
+    assert(!"unreachable");
+}
+
+enum pl_color_levels mp_levels_to_pl(enum mp_csp_levels levels)
+{
+    switch (levels) {
+    case MP_CSP_LEVELS_AUTO:        return PL_COLOR_LEVELS_UNKNOWN;
+    case MP_CSP_LEVELS_TV:          return PL_COLOR_LEVELS_TV;
+    case MP_CSP_LEVELS_PC:          return PL_COLOR_LEVELS_PC;
+    case MP_CSP_LEVELS_COUNT:       return PL_COLOR_LEVELS_COUNT;
+    }
+
+    assert(!"unreachable");
+}
+
+enum pl_alpha_mode mp_alpha_to_pl(enum mp_alpha_type alpha)
+{
+    switch (alpha) {
+    case MP_ALPHA_AUTO:             return PL_ALPHA_UNKNOWN;
+    case MP_ALPHA_STRAIGHT:         return PL_ALPHA_INDEPENDENT;
+    case MP_ALPHA_PREMUL:           return PL_ALPHA_PREMULTIPLIED;
+    }
+
+    assert(!"unreachable");
+}
+
+enum pl_chroma_location mp_chroma_to_pl(enum mp_chroma_location chroma)
+{
+    switch (chroma) {
+    case MP_CHROMA_AUTO:            return PL_CHROMA_UNKNOWN;
+    case MP_CHROMA_TOPLEFT:         return PL_CHROMA_TOP_LEFT;
+    case MP_CHROMA_LEFT:            return PL_CHROMA_LEFT;
+    case MP_CHROMA_CENTER:          return PL_CHROMA_CENTER;
+    case MP_CHROMA_COUNT:           return PL_CHROMA_COUNT;
+    }
+
+    assert(!"unreachable");
+}

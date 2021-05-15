@@ -302,8 +302,98 @@ struct frame_priv {
     struct osd_state subs;
 };
 
+static int plane_data_from_imgfmt(struct pl_plane_data out_data[4],
+                                  struct pl_bit_encoding *out_bits,
+                                  enum mp_imgfmt imgfmt)
+{
+    struct mp_imgfmt_desc desc = mp_imgfmt_get_desc(imgfmt);
+    if (!desc.num_planes || !(desc.flags & MP_IMGFLAG_HAS_COMPS))
+        return 0;
+
+    if (desc.flags & MP_IMGFLAG_HWACCEL)
+        return 0; // HW-accelerated frames need to be mapped differently
+
+    if (!(desc.flags & MP_IMGFLAG_NE))
+        return 0; // GPU endianness follows the host's
+
+    if (desc.flags & MP_IMGFLAG_PAL)
+        return 0; // Palette formats (currently) not supported in libplacebo
+
+    if ((desc.flags & MP_IMGFLAG_TYPE_FLOAT) && (desc.flags & MP_IMGFLAG_YUV))
+        return 0; // Floating-point YUV (currently) unsupported
+
+    bool any_padded = false;
+    for (int p = 0; p < desc.num_planes; p++) {
+        struct pl_plane_data *data = &out_data[p];
+        struct mp_imgfmt_comp_desc sorted[MP_NUM_COMPONENTS];
+        int num_comps = 0;
+        for (int c = 0; c < mp_imgfmt_desc_get_num_comps(&desc); c++) {
+            if (desc.comps[c].plane != p)
+                continue;
+
+            data->component_map[num_comps] = c;
+            sorted[num_comps] = desc.comps[c];
+            num_comps++;
+
+            // Sort components by offset order, while keeping track of the
+            // semantic mapping in `data->component_map`
+            for (int i = num_comps - 1; i > 0; i--) {
+                if (sorted[i].offset >= sorted[i - 1].offset)
+                    break;
+                MPSWAP(struct mp_imgfmt_comp_desc, sorted[i], sorted[i - 1]);
+                MPSWAP(int, data->component_map[i], data->component_map[i - 1]);
+            }
+        }
+
+        uint64_t total_bits = 0;
+
+        // Fill in the pl_plane_data fields for each component
+        memset(data->component_size, 0, sizeof(data->component_size));
+        for (int c = 0; c < num_comps; c++) {
+            data->component_size[c] = sorted[c].size;
+            data->component_pad[c] = sorted[c].offset - total_bits;
+            total_bits += data->component_pad[c] + data->component_size[c];
+            any_padded |= sorted[c].pad;
+
+            // Ignore bit encoding of alpha channel
+            if (!out_bits || data->component_map[c] == PL_CHANNEL_A)
+                continue;
+
+            struct pl_bit_encoding bits = {
+                .sample_depth = data->component_size[c],
+                .color_depth = sorted[c].size - abs(sorted[c].pad),
+                .bit_shift = MPMAX(sorted[c].pad, 0),
+            };
+
+            if (p == 0 && c == 0) {
+                *out_bits = bits;
+            } else {
+                if (!pl_bit_encoding_equal(out_bits, &bits)) {
+                    // Bit encoding differs between components/planes,
+                    // cannot handle this
+                    *out_bits = (struct pl_bit_encoding) {0};
+                    out_bits = NULL;
+                }
+            }
+        }
+
+        if (total_bits % 8)
+            return 0; // pixel size is not byte-aligned
+
+        data->pixel_stride = total_bits / 8;
+        data->type = (desc.flags & MP_IMGFLAG_TYPE_FLOAT)
+                            ? PL_FMT_FLOAT
+                            : PL_FMT_UNORM;
+    }
+
+    if (any_padded && !out_bits)
+        return 0; // can't handle padded components without `pl_bit_encoding`
+
+    return desc.num_planes;
+}
+
 static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src,
-                      struct pl_frame *out_frame)
+                      struct pl_frame *frame)
 {
     struct mp_image *mpi = src->frame_data;
     struct frame_priv *fp = mpi->priv;
@@ -313,13 +403,28 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
 
     // TODO: implement support for hwdec wrappers
 
-    // Re-use the AVFrame helpers to make this infinitely easier
-    struct AVFrame *avframe = mp_image_to_av_frame(mpi);
-    pl_frame_from_avframe(out_frame, avframe);
-    pl_plane_data_from_pixfmt(data, &out_frame->repr.bits, avframe->format);
-    av_frame_free(&avframe);
+    *frame = (struct pl_frame) {
+        .num_planes = mpi->num_planes,
+        .color = {
+            .primaries = mp_prim_to_pl(mpi->params.color.primaries),
+            .transfer = mp_trc_to_pl(mpi->params.color.gamma),
+            .light = mp_light_to_pl(mpi->params.color.light),
+            .sig_peak = mpi->params.color.sig_peak,
+        },
+        .repr = {
+            .sys = mp_csp_to_pl(mpi->params.color.space),
+            .levels = mp_levels_to_pl(mpi->params.color.levels),
+            .alpha = mp_alpha_to_pl(mpi->params.alpha),
+        },
+        .profile = {
+            .data = mpi->icc_profile ? mpi->icc_profile->data : NULL,
+            .len = mpi->icc_profile ? mpi->icc_profile->size : 0,
+        },
+    };
 
-    for (int n = 0; n < mpi->num_planes; n++) {
+    enum pl_chroma_location chroma = mp_chroma_to_pl(mpi->params.chroma_location);
+    int planes = plane_data_from_imgfmt(data, &frame->repr.bits, mpi->imgfmt);
+    for (int n = 0; n < planes; n++) {
         data[n].width = mp_image_plane_w(mpi, n);
         data[n].height = mp_image_plane_h(mpi, n);
         data[n].row_stride = mpi->stride[n];
@@ -335,21 +440,25 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
             data[n].priv = mp_image_new_ref(mpi);
         }
 
-        if (!pl_upload_plane(gpu, &out_frame->planes[n], &tex[n], &data[n])) {
+        struct pl_plane *plane = &frame->planes[n];
+        if (!pl_upload_plane(gpu, plane, &tex[n], &data[n])) {
             MP_ERR(vo, "Failed uploading frame!\n");
             talloc_free(data[n].priv);
             return false;
         }
+
+        if (mpi->fmt.xs[n] || mpi->fmt.ys[n])
+            pl_chroma_location_offset(chroma, &plane->shift_x, &plane->shift_y);
     }
 
     // Generate subtitles for this frame
     struct mp_osd_res vidres = { mpi->w, mpi->h };
-    write_overlays(vo, vidres, mpi->pts, OSD_DRAW_SUB_ONLY, &fp->subs, out_frame);
+    write_overlays(vo, vidres, mpi->pts, OSD_DRAW_SUB_ONLY, &fp->subs, frame);
 
     // Update LUT attached to this frame
     update_lut(p, &p->image_lut);
-    out_frame->lut = p->image_lut.lut;
-    out_frame->lut_type = p->image_lut.type;
+    frame->lut = p->image_lut.lut;
+    frame->lut_type = p->image_lut.type;
     return true;
 }
 
@@ -549,8 +658,18 @@ static void get_vsync(struct vo *vo, struct vo_vsync_info *info)
 static int query_format(struct vo *vo, int format)
 {
     struct priv *p = vo->priv;
-    enum AVPixelFormat pixfmt = imgfmt2pixfmt(format);
-    return pixfmt >= 0 && pl_test_pixfmt(p->gpu, pixfmt);
+    struct pl_bit_encoding bits;
+    struct pl_plane_data data[4];
+    int planes = plane_data_from_imgfmt(data, &bits, format);
+    if (!planes)
+        return false;
+
+    for (int i = 0; i < planes; i++) {
+        if (!pl_plane_find_fmt(p->gpu, NULL, &data[i]))
+            return false;
+    }
+
+    return true;
 }
 
 static void resize(struct vo *vo)

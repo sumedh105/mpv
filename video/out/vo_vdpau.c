@@ -478,7 +478,7 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     VdpStatus vdp_st;
 
     if (!check_preemption(vo))
-        return -1;
+        return 0;
 
     VdpChromaType chroma_type = VDP_CHROMA_TYPE_420;
     mp_vdpau_get_format(params->imgfmt, &chroma_type, NULL);
